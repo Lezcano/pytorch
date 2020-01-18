@@ -137,10 +137,10 @@ union pytorch_qnnp_conv_quantization_params {
   } scalar;
 #if CPUINFO_ARCH_ARM || CPUINFO_ARCH_ARM64
   struct {
-    int16_t kernel_zero_point;
-    int16_t input_zero_point;
-    int32_t multiplier;
-    int32_t right_shift;
+    uint8_t input_zero_point;
+    uint8_t* kernel_zero_point;
+    int32_t* multiplier;
+    int32_t* right_shift;
     int16_t output_zero_point;
     uint8_t output_max;
     uint8_t output_min;
