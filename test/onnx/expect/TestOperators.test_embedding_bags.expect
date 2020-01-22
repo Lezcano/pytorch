@@ -18,6 +18,11 @@ graph {
       type: INT
     }
     attribute {
+      name: "include_last_offset"
+      i: 0
+      type: INT
+    }
+    attribute {
       name: "operator"
       s: "embedding_bag"
       type: STRING
