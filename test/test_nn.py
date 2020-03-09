@@ -32,7 +32,8 @@ import torch.nn.functional as F
 import torch.nn.init as init
 import torch.nn.utils.rnn as rnn_utils
 from torch.nn.utils import clip_grad_norm_, clip_grad_value_
-import torch.nn.utils.prune as prune
+import torch.nn.utils.prune_parametrized as prune
+import torch.nn.utils.parametrize as parametrize
 from torch.nn.utils import parameters_to_vector, vector_to_parameters
 from torch.autograd import gradcheck
 from torch.autograd.gradcheck import gradgradcheck
@@ -2043,7 +2044,7 @@ class TestNN(NNTestCase):
                     # mask has the same size as tensor being pruned
                     self.assertEqual(
                         original_tensor.size(),
-                        getattr(m, name + '_mask').size()
+                        m._parametrizations[name][0].mask.size()
                     )
                     # 'orig' tensor has the same size as the original tensor
                     self.assertEqual(
@@ -2097,7 +2098,7 @@ class TestNN(NNTestCase):
                     self.assertEqual(
                         getattr(m, name),
                         getattr(m, name + '_orig')
-                        * getattr(m, name + '_mask').to(
+                        * m._parametrizations[name][0].mask.to(
                             dtype=original_tensor.dtype
                         ),
                     )
@@ -2252,7 +2253,7 @@ class TestNN(NNTestCase):
 
         y_postpruning = m(input_)
 
-        prune.remove(m, 'weight')
+        m.remove_parametrization('weight')
 
         y_postremoval = m(input_)
         self.assertEqual(y_postpruning, y_postremoval)
@@ -2269,7 +2270,7 @@ class TestNN(NNTestCase):
         prune.random_unstructured(m, name="weight", amount=0.9)
         self.assertEqual(tensor_id, id(list(m.parameters())[0]))
 
-        prune.remove(m, "weight")
+        m.remove_parametrization("weight")
         self.assertEqual(tensor_id, id(list(m.parameters())[0]))
 
     def test_random_pruning_pickle(self):
@@ -2284,7 +2285,7 @@ class TestNN(NNTestCase):
                     self.assertIsInstance(m_new, type(m))
 
     def test_multiple_pruning_calls(self):
-        # if you call pruning twice, the hook becomes a PruningContainer
+        # if you call pruning twice, the hook becomes a PruningMethodList
         m = nn.Conv3d(2, 2, 2)
         prune.l1_unstructured(m, name='weight', amount=0.1)
         weight_mask0 = m.weight_mask  # save it for later sanity check
@@ -2294,7 +2295,7 @@ class TestNN(NNTestCase):
         hook = next(iter(m._forward_pre_hooks.values()))
         self.assertIsInstance(
             hook,
-            torch.nn.utils.prune.PruningContainer
+            torch.nn.utils.prune.PruningMethodList
         )
         # check that container._tensor_name is correctly set no matter how
         # many pruning methods are in the container
@@ -2322,7 +2323,7 @@ class TestNN(NNTestCase):
 
     def test_pruning_container(self):
         # create an empty container
-        container = prune.PruningContainer()
+        container = prune.PruningMethodList()
         container._tensor_name = 'test'
         self.assertEqual(len(container), 0)
 
@@ -2351,7 +2352,7 @@ class TestNN(NNTestCase):
         acting on the right axis.
         """
         # create an empty container
-        container = prune.PruningContainer()
+        container = prune.PruningMethodList()
         container._tensor_name = 'test'
 
         # 1) test unstructured pruning
@@ -2474,8 +2475,8 @@ class TestNN(NNTestCase):
 
 
     def test_remove_pruning(self):
-        r"""`prune.remove` removes the hook and the reparametrization
-        and makes the pruning final in the original parameter.
+        r"""`module.remove_parametrization` removes the hook and the
+        reparametrization and makes the pruning final in the original parameter.
         """
         modules = [nn.Linear(5, 7), nn.Conv3d(2, 2, 2)]
         names = ['weight', 'bias']
@@ -2486,16 +2487,16 @@ class TestNN(NNTestCase):
                     # first prune
                     prune.random_unstructured(m, name, amount=0.5)
                     self.assertIn(name + "_orig", dict(m.named_parameters()))
-                    self.assertIn(name + "_mask", dict(m.named_buffers()))
+                    self.assertIn("mask", dict(m._parametrizations[name][0].named_buffers()))
                     self.assertNotIn(name, dict(m.named_parameters()))
                     self.assertTrue(hasattr(m, name))
                     pruned_t = getattr(m, name)
 
                     # then remove pruning
-                    prune.remove(m, name)
+                    m.remove_parametrization(name)
                     self.assertIn(name, dict(m.named_parameters()))
                     self.assertNotIn(name + "_orig", dict(m.named_parameters()))
-                    self.assertNotIn(name + "_mask", dict(m.named_buffers()))
+                    self.assertTrue(name not in m._parametrizations)
                     final_t = getattr(m, name)
 
                     self.assertEqual(pruned_t, final_t)
@@ -2513,7 +2514,7 @@ class TestNN(NNTestCase):
                     self.assertFalse(prune.is_pruned(m))
                     # since it isn't pruned, pruning can't be removed from it
                     with self.assertRaises(ValueError):
-                        prune.remove(m, name)
+                        m.remove_parametrization(name)
 
 
     def test_global_pruning(self):
@@ -2594,11 +2595,14 @@ class TestNN(NNTestCase):
                         with self.assertRaises(Exception):
                             prune.l1_unstructured(m, name=name, amount=0.9)
 
+                        # This test is going to fail as it is, since now we do not
+                        # compute the parametrizations until everything is properly
+                        # initialized
                         self.assertTrue(
                             name in dict(m.named_parameters())
                         )
-                        self.assertFalse(
-                            name + '_mask' in dict(m.named_buffers())
+                        self.assertTrue(
+                            name not in m._parametrizations
                         )
                         self.assertFalse(
                             name + '_orig' in dict(m.named_parameters())
@@ -2665,7 +2669,7 @@ class TestNN(NNTestCase):
 
         # make pruning permanent and restore parameter names as in base
         # architecture
-        prune.remove(module=model[0], name='weight')
+        model[0].remove_parametrization('weight')
 
         # check that the original weight and the new mask are no longer present
         self.assertNotIn('0.weight_orig', model.state_dict())

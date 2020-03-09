@@ -1,10 +1,12 @@
 from collections import OrderedDict, namedtuple
 import functools
 import itertools
+import operator
 
 import torch
 from ..parameter import Parameter
 import torch.utils.hooks as hooks
+
 
 class _IncompatibleKeys(namedtuple('IncompatibleKeys', ['missing_keys', 'unexpected_keys'])):
     def __repr__(self):
@@ -81,6 +83,8 @@ class Module(object):
         self._state_dict_hooks = OrderedDict()
         self._load_state_dict_pre_hooks = OrderedDict()
         self._modules = OrderedDict()
+        # TODO Add a module.parametrizations() method and more auxiliary methods
+        self._parametrizations = OrderedDict()
 
     def forward(self, *input):
         r"""Defines the computation performed at every call.
@@ -507,6 +511,70 @@ class Module(object):
         self._forward_hooks[handle.id] = hook
         return handle
 
+    def register_parametrization(self, param, tensor_name):
+        orig = getattr(self, tensor_name)
+
+        # We allow the parametrization to register some auxiliary parameters
+        # We pass orig so that it knows the size, device, type,...
+        param.init_parameters(orig)
+
+        param_list = self._parametrizations.get(tensor_name)
+        # In case we need to rollback later
+        new_param = param_list is None
+        if new_param:
+            param_list = ParametrizationList(orig, param)
+            self._parametrizations[tensor_name] = param_list
+        else:
+            param_list.append(param)
+
+        if new_param:
+            # copy `module[tensor_name]` to `module[tensor_name + '_orig']`
+            self.register_parameter(tensor_name + "_orig", orig)
+            # delete `module[tensor_name]`
+            del self._parameters[tensor_name]
+
+    def undo_parametrization(self, tensor_name):
+        r"""Undoes the parametrization. If it is the last parametrization,
+        the buffer ``name`` is deleted, and the parameter named
+        ``name+'_orig'`` is moved back to be the parameter ``name``.
+        Args:
+            tensor_name (str): name of the parametrization to be removed
+        """
+        #TODO Add examples in the doc
+        self._del_parametrization(tensor_name, leave=False)
+
+    def remove_parametrization(self, tensor_name):
+        r"""Removes parametrization. If it is the last parametrization,
+        the parametrized parameter named ``name+'_orig'`` is deleted and
+        the buffer ``name`` is turned into a parameter.
+        Args:
+            tensor_name (str): name of the parametrization to be removed
+        Note:
+            If the ``name+'_orig'`` has different size than ``name+'_orig'``
+            the parameters on the optimizer have to be manually updated via
+            ``optim.params = model.parameters()`` after calling the remove method.
+        """
+        #TODO Add examples in the doc
+        self._del_parametrization(tensor_name, leave=True)
+
+    def _del_parametrization(self, tensor_name, leave):
+        param = self._parametrizations.get(tensor_name)
+        if param is None:
+            raise ValueError("Module {} does not have a "
+                    "parametrization on the parameter {}".format(self, tensor_name))
+
+        orig = self._parameters[tensor_name + "_orig"]
+        if leave:
+            t = param()
+            if t.size() != orig.size():
+                orig = torch.nn.Parameter(t)
+            else:
+                orig.data = t
+
+        del self._parametrizations[tensor_name]
+        del self._parameters[tensor_name + "_orig"]
+        self.register_parameter(tensor_name, orig)
+
 
     def _slow_forward(self, *input, **kwargs):
         tracing_state = torch._C._get_tracing_state()
@@ -580,6 +648,10 @@ class Module(object):
             modules = self.__dict__['_modules']
             if name in modules:
                 return modules[name]
+        if '_parametrizations' in self.__dict__:
+            parametrizations = self.__dict__['_parametrizations']
+            if name in parametrizations:
+                return parametrizations[name]()
         raise AttributeError("'{}' object has no attribute '{}'".format(
             type(self).__name__, name))
 
@@ -971,7 +1043,8 @@ class Module(object):
 
         """
         memo = set()
-        for name, module in self._modules.items():
+        for name, module in itertools.chain(self._modules.items(),
+                                            self._parametrizations.items()):
             if module is not None and module not in memo:
                 memo.add(module)
                 yield name, module
@@ -1164,3 +1237,100 @@ class Module(object):
         replica._buffers = replica._buffers.copy()
         replica._modules = replica._modules.copy()
         return replica
+
+
+# TODO Resolve where to put these
+# TODO Maybe change names to Root and Innernode?
+# TODO This used to be a nn.Sequential
+class SubParametrizationList(Module):
+
+    def __init__(self, tensor_orig, *args):
+        super(SubParametrizationList, self).__init__()
+        if len(args) == 1 and isinstance(args[0], OrderedDict):
+            for _, param in args[0].items():
+                self.append_orig(param, tensor_orig)
+        else:
+            for _, param in enumerate(args):
+                self.append_orig(param, tensor_orig)
+
+    def _get_item_by_idx(self, iterator, idx):
+        """Get the idx-th item of the iterator"""
+        size = len(self)
+        idx = operator.index(idx)
+        if not -size <= idx < size:
+            raise IndexError('index {} is out of range'.format(idx))
+        idx %= size
+        return next(itertools.islice(iterator, idx, None))
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            return self.__class__(OrderedDict(list(self._modules.items())[idx]))
+        else:
+            return self._get_item_by_idx(self._modules.values(), idx)
+
+    def __len__(self):
+        return len(self._modules)
+
+    def __iter__(self):
+        return iter(self._modules.values())
+
+    def forward(self, input_):
+        for module in self:
+            input_ = module(input_)
+        return input_
+
+    def append_orig(self, module, orig):
+        r"""Appends a given parametrization to the end of the list.
+
+        Arguments:
+            module (nn.utils.BaseParametrization): parametrization to append
+        """
+        # We put parametrizations of the same type in the same container in a tree structure
+        # In the tree, the inner nodes are instances of ParametrizationList and
+        # the nodes are instances of BaseParametrization
+        # The root will be of type ParametrizationList
+        # The idea is that BaseParametrization should save the buffers it wants to share with
+        # the other parametrizations of the same type in the corresponding ParametrizationList object,
+        # and these will be shared among all the contiguous elements of this class.
+        # An example of this buffer would be the mask in a PruningMethod
+
+        # Recursive step
+        if len(self) != 0 and isinstance(self[-1], module.LIST_TYPE):
+            self[-1].append_orig(module, orig)
+
+        self_is_correct_list = type(self) != module.LIST_TYPE
+        if not self_is_correct_list:
+            # Wrap it in a LIST_TYPE object
+            module = module.LIST_TYPE(orig, module)
+
+        self.add_module(str(len(self)), module)
+        if self_is_correct_list:
+            # Add or update buffers of the main list
+            self.init_buffers(orig)
+
+    def init_buffers(self, tensor_orig):
+        pass
+
+
+class ParametrizationList(SubParametrizationList):
+    def __init__(self, tensor_orig, *parametrizations):
+        super(ParametrizationList, self).__init__(tensor_orig, *parametrizations)
+        # TODO When we add it, do we have to wrap it or add it to a previous wrapper?
+        self.orig = tensor_orig
+        self.caching = False
+        self.register_buffer("cache", None)
+
+    def forward(self):
+        if self.caching:
+            return self.cache
+        else:
+            return super(ParametrizationList, self).forward(self.orig)
+
+    def append(self, module):
+        super(ParametrizationList, self).append_orig(module, self.orig)
+
+    def update_cache(self):
+        self.cache = self()
+
+    def invalidate_cache(self):
+        self.cache = None
