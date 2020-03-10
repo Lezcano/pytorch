@@ -2044,12 +2044,12 @@ class TestNN(NNTestCase):
                     # mask has the same size as tensor being pruned
                     self.assertEqual(
                         original_tensor.size(),
-                        m._parametrizations[name][0].mask.size()
+                        m._parametrizations[name].mask.size()
                     )
                     # 'orig' tensor has the same size as the original tensor
                     self.assertEqual(
                         original_tensor.size(),
-                        getattr(m, name + '_orig').size()
+                        m._parametrizations[name].orig.size()
                     )
                     # new tensor has the same size as the original tensor
                     self.assertEqual(
@@ -2076,7 +2076,7 @@ class TestNN(NNTestCase):
                     prune.random_unstructured(m, name=name, amount=0.1)
                     self.assertEqual(
                         original_tensor,
-                        getattr(m, name + '_orig')
+                        m._parametrizations[name].orig
                     )
 
     def test_random_pruning_new_weight(self):
@@ -2097,8 +2097,8 @@ class TestNN(NNTestCase):
                     # weight = weight_orig * weight_mask
                     self.assertEqual(
                         getattr(m, name),
-                        getattr(m, name + '_orig')
-                        * m._parametrizations[name][0].mask.to(
+                        m._parametrizations[name].orig
+                        * m._parametrizations[name].mask.to(
                             dtype=original_tensor.dtype
                         ),
                     )
@@ -2129,7 +2129,7 @@ class TestNN(NNTestCase):
 
         # with mask of 1s, grad should be identical to no mask
         y_postpruning.sum().backward()
-        self.assertEqual(old_grad_weight, m.weight_orig.grad)
+        self.assertEqual(old_grad_weight, m._parametrizations["weight"].orig.grad)
         self.assertEqual(old_grad_bias, m.bias.grad)
 
         # calling forward twice in a row shouldn't change output
@@ -2168,7 +2168,7 @@ class TestNN(NNTestCase):
 
         # with mask of 1s, grad should be identical to no mask
         y_postpruning.sum().backward()
-        self.assertEqual(old_grad_weight, m.weight_orig.grad)
+        self.assertEqual(old_grad_weight, m._parametrizations["weight"].orig.grad)
         self.assertEqual(old_grad_bias, m.bias.grad)
 
         # calling forward twice in a row shouldn't change output
@@ -2196,18 +2196,19 @@ class TestNN(NNTestCase):
         y_postpruning = m(input_)
         y_postpruning.sum().backward()
         # weight_orig is the parameter, so it's the tensor that will accumulate the grad
-        self.assertEqual(m.weight_orig.grad, mask)  # all 1s, except for masked units
+        self.assertEqual(m._parametrizations["weight"].orig.grad, mask)  # all 1s, except for masked units
         self.assertEqual(m.bias.grad, torch.ones_like(m.bias))
 
         # make sure that weight_orig update doesn't modify [1, 0] and [0, 3]
-        old_weight_orig = m.weight_orig.clone()
+        old_weight_orig = m._parametrizations["weight"].orig.clone()
         # update weights
         learning_rate = 1.
         for p in m.parameters():
             p.data.sub_(p.grad.data * learning_rate)
         # since these are pruned, they should not be updated
-        self.assertEqual(old_weight_orig[1, 0], m.weight_orig[1, 0])
-        self.assertEqual(old_weight_orig[0, 3], m.weight_orig[0, 3])
+        new_weight_orig = m._parametrizations["weight"].orig
+        self.assertEqual(old_weight_orig[1, 0], new_weight_orig[1, 0])
+        self.assertEqual(old_weight_orig[0, 3], new_weight_orig[0, 3])
 
     @unittest.skipIf(not PY3, "mock is not available in Python 2")
     def test_random_pruning_forward(self):
@@ -2228,8 +2229,8 @@ class TestNN(NNTestCase):
             prune.random_unstructured(m, name='weight', amount=0.9)
 
         yhat = m(input_)
-        self.assertEqual(yhat[0, 0], m.weight_orig[0, 3] + m.bias[0])
-        self.assertEqual(yhat[0, 1], m.weight_orig[1, 0] + m.bias[1])
+        self.assertEqual(yhat[0, 0], m._parametrizations["weight"].orig[0, 3] + m.bias[0])
+        self.assertEqual(yhat[0, 1], m._parametrizations["weight"].orig[1, 0] + m.bias[1])
 
     @unittest.skipIf(not PY3, "mock is not available in Python 2")
     def test_remove_pruning_forward(self):
@@ -2268,10 +2269,10 @@ class TestNN(NNTestCase):
         tensor_id = id(list(m.parameters())[0])
 
         prune.random_unstructured(m, name="weight", amount=0.9)
-        self.assertEqual(tensor_id, id(list(m.parameters())[0]))
+        self.assertEqual(tensor_id, id(list(m._parametrizations["weight"].parameters())[0]))
 
         m.remove_parametrization("weight")
-        self.assertEqual(tensor_id, id(list(m.parameters())[0]))
+        self.assertEqual(tensor_id, id(m.weight))
 
     def test_random_pruning_pickle(self):
         modules = [nn.Linear(5, 7), nn.Conv3d(2, 2, 2)]
@@ -2288,7 +2289,7 @@ class TestNN(NNTestCase):
         # if you call pruning twice, the hook becomes a PruningMethodList
         m = nn.Conv3d(2, 2, 2)
         prune.l1_unstructured(m, name='weight', amount=0.1)
-        weight_mask0 = m.weight_mask  # save it for later sanity check
+        weight_mask0 = m._parametrizations["weight"].mask  # save it for later sanity check
 
         # prune again
         prune.ln_structured(m, name='weight', amount=0.3, n=2, dim=0)
@@ -2312,7 +2313,8 @@ class TestNN(NNTestCase):
 
         # check that all entries that are 0 in the 1st mask are 0 in the
         # 2nd mask too
-        self.assertTrue(torch.all(m.weight_mask[weight_mask0 == 0] == 0))
+        weight_mask = m._parametrizations["weight"].mask
+        self.assertTrue(torch.all(weight_mask[weight_mask0 == 0] == 0))
 
         # prune again
         prune.ln_structured(m, name='weight', amount=0.1, n=float('inf'), dim=1)
@@ -2486,8 +2488,8 @@ class TestNN(NNTestCase):
                 with self._compatible_subtest(m=m, name=name):
                     # first prune
                     prune.random_unstructured(m, name, amount=0.5)
-                    self.assertIn(name + "_orig", dict(m.named_parameters()))
-                    self.assertIn("mask", dict(m._parametrizations[name][0].named_buffers()))
+                    self.assertIn("orig", dict(m._parametrizations[name].named_parameters()))
+                    self.assertIn("mask", dict(m._parametrizations[name].named_buffers()))
                     self.assertNotIn(name, dict(m.named_parameters()))
                     self.assertTrue(hasattr(m, name))
                     pruned_t = getattr(m, name)
@@ -2495,8 +2497,7 @@ class TestNN(NNTestCase):
                     # then remove pruning
                     m.remove_parametrization(name)
                     self.assertIn(name, dict(m.named_parameters()))
-                    self.assertNotIn(name + "_orig", dict(m.named_parameters()))
-                    self.assertTrue(name not in m._parametrizations)
+                    self.assertNotIn(name, m._parametrizations)
                     final_t = getattr(m, name)
 
                     self.assertEqual(pruned_t, final_t)
@@ -2603,9 +2604,6 @@ class TestNN(NNTestCase):
                         )
                         self.assertTrue(
                             name not in m._parametrizations
-                        )
-                        self.assertFalse(
-                            name + '_orig' in dict(m.named_parameters())
                         )
 
     def test_pruning_serialization_model(self):

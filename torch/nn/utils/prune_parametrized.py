@@ -1,151 +1,107 @@
 r"""
 Pruning methods
 """
-from abc import abstractmethod
 import numbers
 import torch
-from .parametrize import BaseParametrization
-from ..modules.module import SubParametrizationList
-# For Python 2 and 3 support
-try:
-    from abc import ABC
-    from collections.abc import Iterable
-except ImportError:
-    from abc import ABCMeta
-    ABC = ABCMeta('ABC', (), {})
-    from collections import Iterable
+from torch.nn import Parametrization
 
 
-class PruningMethodList(SubParametrizationList):
+class BasePruning(Parametrization):
+
+    def __init__(self, tensor):
+        super(BasePruning, self).__init__()
+        # Merge previous pruning methods
+        prev_param = self._parametrizations.get("orig")
+        if prev_param is not None and isinstance(prev_param, BasePruning):
+            default_mask = prev_param.mask
+            # Merge the two pruning methods
+            prev_prev_param = prev_param._parametrizations.get("orig")
+            # Is the previous the last parametrization?
+            if prev_param is None:
+                orig = prev_param.original
+                del self._parametrizations["orig"]
+                self.register_parameter("orig", orig)
+            else:
+                self._parametrizations["orig"] = prev_prev_param
+        else:
+            default_mask = torch.ones_like(tensor_orig)
+        self.register_buffer("mask", default_mask)
+
+        self.mask_init_(tensor_orig, self.mask)
 
     def forward(self, t):
-        # The mask contains the prunning of all methods of PruningMethodList
-        return self[0](t, self.mask)
+        return self.mask * t
 
-    def init_buffers(self, tensor_orig):
-        default_mask = self._buffers.get("mask")
-        first_time = default_mask is None
-        if first_time:
-            default_mask = torch.ones_like(tensor_orig)
-        else:
-            default_mask = default_mask.detach().clone(memory_format=torch.contiguous_format)
-
-        mask = self.compute_mask(tensor_orig, default_mask=default_mask)
-
-        if first_time:
-            self.register_buffer("mask", mask)
-        else:
-            self._buffers["mask"] = mask
-
-    def compute_mask(self, t, default_mask):
-        r"""Applies the latest ``method`` by computing the new partial masks
-        and returning its combination with the ``default_mask``.
-        The new partial mask should be computed on the entries or channels
-        that were not zeroed out by the ``default_mask``.
-        Which portions of the tensor ``t`` the new mask will be calculated from
-        depends on the ``PRUNING_TYPE`` (handled by the type handler):
-            * for 'unstructured', the mask will be computed from the raveled
-            list of nonmasked entries;
-
-            * for 'structured', the mask will be computed from the nonmasked
-            channels in the tensor;
-
-            * for 'global', the mask will be computed across all entries.
-
+    def mask_init_(self, t, mask=None):
+        r"""
         Args:
             t (torch.Tensor): tensor representing the parameter to prune
-                (of same dimensions as ``default_mask``).
-            default_mask (torch.Tensor): mask from previous pruning iteration.
+                (of same dimensions as mask).
+            mask (torch.Tensor): mask from previous pruning iteration
 
         Returns:
-            mask (torch.Tensor): new mask that combines the effects
-            of the ``default_mask`` and the new mask from the current
-            pruning ``method`` (of same dimensions as ``default_mask`` and
-            ``t``).
+            new_mask (torch.Tensor): new mask that combines the effects
+                of the old mask and the new mask from the current
+                pruning method (of same dimensions as mask and t).
         """
-        def _combine_masks(method, t, mask):
-            r"""
-            Args:
-                method (a BasePruningMethod subclass): pruning method
-                    currently being applied.
-                t (torch.Tensor): tensor representing the parameter to prune
-                    (of same dimensions as mask).
-                mask (torch.Tensor): mask from previous pruning iteration
+        if mask is None:
+            mask = torch.ones_like(t)
 
-            Returns:
-                new_mask (torch.Tensor): new mask that combines the effects
-                    of the old mask and the new mask from the current
-                    pruning method (of same dimensions as mask and t).
-            """
-            new_mask = mask  # start off from existing mask
-            new_mask = new_mask.to(dtype=t.dtype)
+        # compute a slice of t onto which the new pruning method will operate
+        if self.PRUNING_TYPE == "unstructured":
+            # prune entries of t where the mask is 1
+            slc = mask == 1
 
-            # compute a slice of t onto which the new pruning method will operate
-            if method.PRUNING_TYPE == "unstructured":
-                # prune entries of t where the mask is 1
-                slc = mask == 1
-
-            # for struct pruning, exclude channels that have already been
-            # entirely pruned
-            elif method.PRUNING_TYPE == "structured":
-                if not hasattr(method, "dim"):
-                    raise AttributeError(
-                        "Pruning methods of PRUNING_TYPE "
-                        '"structured" need to have the attribute `dim` defined.'
-                    )
-
-                # find the channels to keep by removing the ones that have been
-                # zeroed out already (i.e. where sum(entries) == 0)
-                n_dims = t.dim()  # "is this a 2D tensor? 3D? ..."
-                dim = method.dim
-                # convert negative indexing
-                if dim < 0:
-                    dim = n_dims + dim
-                # if dim is still negative after subtracting it from n_dims
-                if dim < 0:
-                    raise IndexError(
-                        'Index is out of bounds for tensor with dimensions {}'
-                        .format(n_dims)
-                    )
-                # find channels along dim = dim that aren't already tots 0ed out
-                keep_channel = (
-                    mask.sum(dim=[d for d in range(n_dims) if d != dim]) != 0
-                )
-                # create slice to identify what to prune
-                slc = [slice(None)] * n_dims
-                slc[dim] = keep_channel
-
-            elif method.PRUNING_TYPE == "global":
-                n_dims = len(t.shape)  # "is this a 2D tensor? 3D? ..."
-                slc = [slice(None)] * n_dims
-
-            else:
-                raise ValueError(
-                    "Unrecognized PRUNING_TYPE {}".format(method.PRUNING_TYPE)
+        # for struct pruning, exclude channels that have already been
+        # entirely pruned
+        elif self.PRUNING_TYPE == "structured":
+            if not hasattr(self, "dim"):
+                raise AttributeError(
+                    "Pruning methods of PRUNING_TYPE "
+                    '"structured" need to have the attribute `dim` defined.'
                 )
 
-            # compute the new mask on the unpruned slice of the tensor t
-            partial_mask = method.compute_mask(t[slc], default_mask=mask[slc])
-            new_mask[slc] = partial_mask.to(dtype=new_mask.dtype)
+            # find the channels to keep by removing the ones that have been
+            # zeroed out already (i.e. where sum(entries) == 0)
+            n_dims = t.dim()  # "is this a 2D tensor? 3D? ..."
+            dim = self.dim
+            # convert negative indexing
+            if dim < 0:
+                dim = n_dims + dim
+            # if dim is still negative after subtracting it from n_dims
+            if dim < 0:
+                raise IndexError(
+                    'Index is out of bounds for tensor with dimensions {}'
+                    .format(n_dims)
+                )
+            # find channels along dim = dim that aren't already tots 0ed out
+            keep_channel = (
+                mask.sum(dim=[d for d in range(n_dims) if d != dim]) != 0
+            )
+            # create slice to identify what to prune
+            slc = [slice(None)] * n_dims
+            slc[dim] = keep_channel
 
-            return new_mask
+        elif self.PRUNING_TYPE == "global":
+            n_dims = len(t.shape)  # "is this a 2D tensor? 3D? ..."
+            slc = [slice(None)] * n_dims
 
-        method = self[-1]
-        mask = _combine_masks(method, t, default_mask)
+        else:
+            raise ValueError(
+                "Unrecognized PRUNING_TYPE {}".format(self.PRUNING_TYPE)
+            )
+
+        # compute the new mask on the unpruned slice of the tensor t
+        partial_mask = self.compute_mask(t[slc], default_mask=mask[slc])
+        mask[slc] = partial_mask.to(dtype=mask.dtype)
+
         return mask
-
-
-class BasePruningMethod(BaseParametrization):
-    LIST_TYPE = PruningMethodList
 
     def compute_mask(self, t, default_mask):
         raise NotImplementedError()
 
-    def forward(self, t, mask):
-        return mask * t
 
-
-class Identity(BasePruningMethod):
+class Identity(BasePruning):
     r"""Utility pruning method that does not prune any units but generates the
     pruning parametrization with a mask of ones.
     """
@@ -153,11 +109,10 @@ class Identity(BasePruningMethod):
     PRUNING_TYPE = "unstructured"
 
     def compute_mask(self, t, default_mask):
-        mask = default_mask
-        return mask
+        return default_mask
 
 
-class RandomUnstructured(BasePruningMethod):
+class RandomUnstructured(BasePruning):
     r"""Prune (currently unpruned) units in a tensor at random.
 
     Args:
@@ -198,7 +153,7 @@ class RandomUnstructured(BasePruningMethod):
         return mask
 
 
-class L1Unstructured(BasePruningMethod):
+class L1Unstructured(BasePruning):
     r"""Prune (currently unpruned) units in a tensor by zeroing out the ones
     with the lowest L1-norm.
 
@@ -242,7 +197,7 @@ class L1Unstructured(BasePruningMethod):
         return mask
 
 
-class RandomStructured(BasePruningMethod):
+class RandomStructured(BasePruning):
     r"""Prune entire (currently unpruned) channels in a tensor at random.
 
     Args:
@@ -327,7 +282,7 @@ class RandomStructured(BasePruningMethod):
         return mask
 
 
-class LnStructured(BasePruningMethod):
+class LnStructured(BasePruning):
     r"""Prune entire (currently unpruned) channels in a tensor based on their
     Ln-norm.
 
@@ -426,7 +381,7 @@ class LnStructured(BasePruningMethod):
         return mask
 
 
-class CustomFromMask(BasePruningMethod):
+class CustomFromMask(BasePruning):
 
     PRUNING_TYPE = "global"
 
@@ -438,176 +393,6 @@ class CustomFromMask(BasePruningMethod):
         assert default_mask.shape == self.mask.shape
         mask = default_mask * self.mask.to(dtype=default_mask.dtype)
         return mask
-
-
-def identity(module, name):
-    r"""Applies pruning reparametrization to the tensor corresponding to the
-    parameter called ``name`` in ``module`` without actually pruning any
-    units. Modifies module in place (and also return the modified module)
-    by:
-    1) adding a named buffer called ``name+'_mask'`` corresponding to the
-    binary mask applied to the parameter ``name`` by the pruning method.
-    2) replacing the parameter ``name`` by its pruned version, while the
-    original (unpruned) parameter is stored in a new parameter named
-    ``name+'_orig'``.
-
-    Note:
-        The mask is a tensor of ones.
-
-    Args:
-        module (nn.Module): module containing the tensor to prune.
-        name (str): parameter name within ``module`` on which pruning
-                will act.
-
-    Returns:
-        module (nn.Module): modified (i.e. pruned) version of the input module
-
-    Examples:
-        >>> m = prune.identity(nn.Linear(2, 3), 'bias')
-        >>> print(m.bias_mask)
-        tensor([1., 1., 1.])
-    """
-    module.register_parametrization(Identity(), name)
-    return module
-
-
-def random_unstructured(module, name, amount):
-    r"""Prunes tensor corresponding to parameter called ``name`` in ``module``
-    by removing the specified ``amount`` of (currently unpruned) units
-    selected at random.
-    Modifies module in place (and also return the modified module) by:
-    1) adding a named buffer called ``name+'_mask'`` corresponding to the
-    binary mask applied to the parameter `name` by the pruning method.
-    2) replacing the parameter ``name`` by its pruned version, while the
-    original (unpruned) parameter is stored in a new parameter named
-    ``name+'_orig'``.
-
-    Args:
-        module (nn.Module): module containing the tensor to prune
-        name (str): parameter name within ``module`` on which pruning
-                will act.
-        amount (int or float): quantity of parameters to prune.
-            If ``float``, should be between 0.0 and 1.0 and represent the
-            fraction of parameters to prune. If ``int``, it represents the
-            absolute number of parameters to prune.
-
-    Returns:
-        module (nn.Module): modified (i.e. pruned) version of the input module
-
-    Examples:
-        >>> m = prune.random_unstructured(nn.Linear(2, 3), 'weight', amount=1)
-        >>> torch.sum(m.weight_mask == 0)
-        tensor(1)
-
-    """
-    module.register_parametrization(RandomUnstructured(amount), name)
-    return module
-
-
-def l1_unstructured(module, name, amount):
-    r"""Prunes tensor corresponding to parameter called ``name`` in ``module``
-    by removing the specified `amount` of (currently unpruned) units with the
-    lowest L1-norm.
-    Modifies module in place (and also return the modified module)
-    by:
-    1) adding a named buffer called ``name+'_mask'`` corresponding to the
-    binary mask applied to the parameter ``name`` by the pruning method.
-    2) replacing the parameter ``name`` by its pruned version, while the
-    original (unpruned) parameter is stored in a new parameter named
-    ``name+'_orig'``.
-
-    Args:
-        module (nn.Module): module containing the tensor to prune
-        name (str): parameter name within ``module`` on which pruning
-                will act.
-        amount (int or float): quantity of parameters to prune.
-            If ``float``, should be between 0.0 and 1.0 and represent the
-            fraction of parameters to prune. If ``int``, it represents the
-            absolute number of parameters to prune.
-
-    Returns:
-        module (nn.Module): modified (i.e. pruned) version of the input module
-
-    Examples:
-        >>> m = prune.l1_unstructured(nn.Linear(2, 3), 'weight', amount=0.2)
-        >>> m.state_dict().keys()
-        odict_keys(['bias', 'weight_orig', 'weight_mask'])
-    """
-    module.register_parametrization(L1Unstructured(amount), name)
-    return module
-
-
-def random_structured(module, name, amount, dim):
-    r"""Prunes tensor corresponding to parameter called ``name`` in ``module``
-    by removing the specified ``amount`` of (currently unpruned) channels
-    along the specified ``dim`` selected at random.
-    Modifies module in place (and also return the modified module)
-    by:
-    1) adding a named buffer called ``name+'_mask'`` corresponding to the
-    binary mask applied to the parameter ``name`` by the pruning method.
-    2) replacing the parameter ``name`` by its pruned version, while the
-    original (unpruned) parameter is stored in a new parameter named
-    ``name+'_orig'``.
-
-    Args:
-        module (nn.Module): module containing the tensor to prune
-        name (str): parameter name within ``module`` on which pruning
-                will act.
-        amount (int or float): quantity of parameters to prune.
-            If ``float``, should be between 0.0 and 1.0 and represent the
-            fraction of parameters to prune. If ``int``, it represents the
-            absolute number of parameters to prune.
-        dim (int): index of the dim along which we define channels to prune.
-
-    Returns:
-        module (nn.Module): modified (i.e. pruned) version of the input module
-
-    Examples:
-        >>> m = prune.random_structured(
-                nn.Linear(5, 3), 'weight', amount=3, dim=1
-            )
-        >>> columns_pruned = int(sum(torch.sum(m.weight, dim=0) == 0))
-        >>> print(columns_pruned)
-        3
-    """
-    module.register_parametrization(RandomStructured(amount, dim), name)
-    return module
-
-
-def ln_structured(module, name, amount, n, dim):
-    r"""Prunes tensor corresponding to parameter called ``name`` in ``module``
-    by removing the specified ``amount`` of (currently unpruned) channels
-    along the specified ``dim`` with the lowest L``n``-norm.
-    Modifies module in place (and also return the modified module)
-    by:
-    1) adding a named buffer called ``name+'_mask'`` corresponding to the
-    binary mask applied to the parameter ``name`` by the pruning method.
-    2) replacing the parameter ``name`` by its pruned version, while the
-    original (unpruned) parameter is stored in a new parameter named
-    ``name+'_orig'``.
-
-    Args:
-        module (nn.Module): module containing the tensor to prune
-        name (str): parameter name within ``module`` on which pruning
-                will act.
-        amount (int or float): quantity of parameters to prune.
-            If ``float``, should be between 0.0 and 1.0 and represent the
-            fraction of parameters to prune. If ``int``, it represents the
-            absolute number of parameters to prune.
-        n (int, float, inf, -inf, 'fro', 'nuc'): See documentation of valid
-            entries for argument ``p`` in :func:`torch.norm`.
-        dim (int): index of the dim along which we define channels to prune.
-
-    Returns:
-        module (nn.Module): modified (i.e. pruned) version of the input module
-
-    Examples:
-        >>> m = prune.ln_structured(
-               nn.Conv2d(5, 3, 2), 'weight', amount=0.3, dim=1, n=float('-inf')
-            )
-    """
-    module.register_parametrization(LnStructured(amount, n, dim), name)
-    return module
 
 
 def global_unstructured(parameters, pruning_method, **kwargs):
@@ -701,7 +486,6 @@ def global_unstructured(parameters, pruning_method, **kwargs):
     # Pointer for slicing the mask to match the shape of each parameter
     pointer = 0
     for module, name in parameters:
-
         param = getattr(module, name)
         # The length of the parameter
         num_param = param.numel()
@@ -713,38 +497,6 @@ def global_unstructured(parameters, pruning_method, **kwargs):
 
         # Increment the pointer to continue slicing the final_mask
         pointer += num_param
-
-
-def custom_from_mask(module, name, mask):
-    r"""Prunes tensor corresponding to parameter called ``name`` in ``module``
-    by applying the pre-computed mask in ``mask``.
-    Modifies module in place (and also return the modified module)
-    by:
-    1) adding a named buffer called ``name+'_mask'`` corresponding to the
-    binary mask applied to the parameter ``name`` by the pruning method.
-    2) replacing the parameter ``name`` by its pruned version, while the
-    original (unpruned) parameter is stored in a new parameter named
-    ``name+'_orig'``.
-
-    Args:
-        module (nn.Module): module containing the tensor to prune
-        name (str): parameter name within ``module`` on which pruning
-            will act.
-        mask (Tensor): binary mask to be applied to the parameter.
-
-    Returns:
-        module (nn.Module): modified (i.e. pruned) version of the input module
-
-    Examples:
-        >>> m = prune.custom_from_mask(
-                nn.Linear(5, 3), name='bias', mask=torch.Tensor([0, 1, 0])
-            )
-        >>> print(m.bias_mask)
-        tensor([0., 1., 0.])
-
-    """
-    module.register_parametrization(CustomFromMask(mask), name)
-    return module
 
 
 def _validate_pruning_amount_init(amount):
@@ -887,5 +639,194 @@ def _compute_norm(t, n, dim):
     norm = torch.norm(t, p=n, dim=dims)
     return norm
 
-def is_pruned(m):
-    return len(m._parametrizations) > 0
+
+def is_pruned(m, tensor_name):
+    pruning = m._parametrizations.get(tensor_name)
+    return pruning is not None and isinstance(pruning, BasePruning)
+
+
+def identity(module, name):
+    r"""Applies pruning reparametrization to the tensor corresponding to the
+    parameter called ``name`` in ``module`` without actually pruning any
+    units. Modifies module in place (and also return the modified module)
+    by:
+    1) adding a named buffer called ``name+'_mask'`` corresponding to the
+    binary mask applied to the parameter ``name`` by the pruning method.
+    2) replacing the parameter ``name`` by its pruned version, while the
+    original (unpruned) parameter is stored in a new parameter named
+    ``name+'_orig'``.
+    Note:
+        The mask is a tensor of ones.
+    Args:
+        module (nn.Module): module containing the tensor to prune.
+        name (str): parameter name within ``module`` on which pruning
+                will act.
+    Returns:
+        module (nn.Module): modified (i.e. pruned) version of the input module
+    Examples:
+        >>> m = prune.identity(nn.Linear(2, 3), 'bias')
+        >>> print(m.bias_mask)
+        tensor([1., 1., 1.])
+    """
+    param = Identity()
+    module.register_parametrization(param, name)
+    return module
+
+
+def random_unstructured(module, name, amount):
+    r"""Prunes tensor corresponding to parameter called ``name`` in ``module``
+    by removing the specified ``amount`` of (currently unpruned) units
+    selected at random.
+    Modifies module in place (and also return the modified module) by:
+    1) adding a named buffer called ``name+'_mask'`` corresponding to the
+    binary mask applied to the parameter `name` by the pruning method.
+    2) replacing the parameter ``name`` by its pruned version, while the
+    original (unpruned) parameter is stored in a new parameter named
+    ``name+'_orig'``.
+    Args:
+        module (nn.Module): module containing the tensor to prune
+        name (str): parameter name within ``module`` on which pruning
+                will act.
+        amount (int or float): quantity of parameters to prune.
+            If ``float``, should be between 0.0 and 1.0 and represent the
+            fraction of parameters to prune. If ``int``, it represents the
+            absolute number of parameters to prune.
+    Returns:
+        module (nn.Module): modified (i.e. pruned) version of the input module
+    Examples:
+        >>> m = prune.random_unstructured(nn.Linear(2, 3), 'weight', amount=1)
+        >>> torch.sum(m.weight_mask == 0)
+        tensor(1)
+    """
+    param = RandomUnstructured(amount)
+    module.register_parametrization(param, name)
+    return module
+
+
+def l1_unstructured(module, name, amount):
+    r"""Prunes tensor corresponding to parameter called ``name`` in ``module``
+    by removing the specified `amount` of (currently unpruned) units with the
+    lowest L1-norm.
+    Modifies module in place (and also return the modified module)
+    by:
+    1) adding a named buffer called ``name+'_mask'`` corresponding to the
+    binary mask applied to the parameter ``name`` by the pruning method.
+    2) replacing the parameter ``name`` by its pruned version, while the
+    original (unpruned) parameter is stored in a new parameter named
+    ``name+'_orig'``.
+    Args:
+        module (nn.Module): module containing the tensor to prune
+        name (str): parameter name within ``module`` on which pruning
+                will act.
+        amount (int or float): quantity of parameters to prune.
+            If ``float``, should be between 0.0 and 1.0 and represent the
+            fraction of parameters to prune. If ``int``, it represents the
+            absolute number of parameters to prune.
+    Returns:
+        module (nn.Module): modified (i.e. pruned) version of the input module
+    Examples:
+        >>> m = prune.l1_unstructured(nn.Linear(2, 3), 'weight', amount=0.2)
+        >>> m.state_dict().keys()
+        odict_keys(['bias', 'weight_orig', 'weight_mask'])
+    """
+    param = L1Unstructured(amount)
+    module.register_parametrization(param, name)
+    return module
+
+
+def random_structured(module, name, amount, dim):
+    r"""Prunes tensor corresponding to parameter called ``name`` in ``module``
+    by removing the specified ``amount`` of (currently unpruned) channels
+    along the specified ``dim`` selected at random.
+    Modifies module in place (and also return the modified module)
+    by:
+    1) adding a named buffer called ``name+'_mask'`` corresponding to the
+    binary mask applied to the parameter ``name`` by the pruning method.
+    2) replacing the parameter ``name`` by its pruned version, while the
+    original (unpruned) parameter is stored in a new parameter named
+    ``name+'_orig'``.
+    Args:
+        module (nn.Module): module containing the tensor to prune
+        name (str): parameter name within ``module`` on which pruning
+                will act.
+        amount (int or float): quantity of parameters to prune.
+            If ``float``, should be between 0.0 and 1.0 and represent the
+            fraction of parameters to prune. If ``int``, it represents the
+            absolute number of parameters to prune.
+        dim (int): index of the dim along which we define channels to prune.
+    Returns:
+        module (nn.Module): modified (i.e. pruned) version of the input module
+    Examples:
+        >>> m = prune.random_structured(
+                nn.Linear(5, 3), 'weight', amount=3, dim=1
+            )
+        >>> columns_pruned = int(sum(torch.sum(m.weight, dim=0) == 0))
+        >>> print(columns_pruned)
+        3
+    """
+    param = RandomStructured(amount, dim)
+    module.register_parametrization(param, name)
+    return module
+
+
+def ln_structured(module, name, amount, n, dim):
+    r"""Prunes tensor corresponding to parameter called ``name`` in ``module``
+    by removing the specified ``amount`` of (currently unpruned) channels
+    along the specified ``dim`` with the lowest L``n``-norm.
+    Modifies module in place (and also return the modified module)
+    by:
+    1) adding a named buffer called ``name+'_mask'`` corresponding to the
+    binary mask applied to the parameter ``name`` by the pruning method.
+    2) replacing the parameter ``name`` by its pruned version, while the
+    original (unpruned) parameter is stored in a new parameter named
+    ``name+'_orig'``.
+    Args:
+        module (nn.Module): module containing the tensor to prune
+        name (str): parameter name within ``module`` on which pruning
+                will act.
+        amount (int or float): quantity of parameters to prune.
+            If ``float``, should be between 0.0 and 1.0 and represent the
+            fraction of parameters to prune. If ``int``, it represents the
+            absolute number of parameters to prune.
+        n (int, float, inf, -inf, 'fro', 'nuc'): See documentation of valid
+            entries for argument ``p`` in :func:`torch.norm`.
+        dim (int): index of the dim along which we define channels to prune.
+    Returns:
+        module (nn.Module): modified (i.e. pruned) version of the input module
+    Examples:
+        >>> m = prune.ln_structured(
+               nn.Conv2d(5, 3, 2), 'weight', amount=0.3, dim=1, n=float('-inf')
+            )
+    """
+    param = LnStructured(amount, n, dim)
+    module.register_parametrization(param, name)
+    return module
+
+
+def custom_from_mask(module, name, mask):
+    r"""Prunes tensor corresponding to parameter called ``name`` in ``module``
+    by applying the pre-computed mask in ``mask``.
+    Modifies module in place (and also return the modified module)
+    by:
+    1) adding a named buffer called ``name+'_mask'`` corresponding to the
+    binary mask applied to the parameter ``name`` by the pruning method.
+    2) replacing the parameter ``name`` by its pruned version, while the
+    original (unpruned) parameter is stored in a new parameter named
+    ``name+'_orig'``.
+    Args:
+        module (nn.Module): module containing the tensor to prune
+        name (str): parameter name within ``module`` on which pruning
+            will act.
+        mask (Tensor): binary mask to be applied to the parameter.
+    Returns:
+        module (nn.Module): modified (i.e. pruned) version of the input module
+    Examples:
+        >>> m = prune.custom_from_mask(
+                nn.Linear(5, 3), name='bias', mask=torch.Tensor([0, 1, 0])
+            )
+        >>> print(m.bias_mask)
+        tensor([0., 1., 0.])
+    """
+    param = CustomFromMask(mask)
+    module.register_parametrization(param, name)
+    return module
