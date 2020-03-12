@@ -82,7 +82,6 @@ class Module(object):
         self._state_dict_hooks = OrderedDict()
         self._load_state_dict_pre_hooks = OrderedDict()
         self._modules = OrderedDict()
-        # TODO Add a module.parametrizations() method and more auxiliary methods
         self._parametrizations = OrderedDict()
 
     def forward(self, *input):
@@ -538,6 +537,8 @@ class Module(object):
             parametrization.register_parameter("orig", orig)
             # Delete the original parameter from this module
             del self._parameters[tensor_name]
+            # Initialise the parametrization
+            parametrization.init(orig)
         else:
             # Putting a parametrization on a paramterization
             prev_param = self._parametrizations.get(tensor_name)
@@ -546,9 +547,23 @@ class Module(object):
                 self._parametrizations[tensor_name] = parametrization
                 # Put a parametrization on the "orig" parameter
                 parametrization._parametrizations["orig"] = prev_param
+                # Initialise the parametrization
+                parametrization.init(prev_param.orig)
             else:
                 raise ValueError("Module '{}' does not have a parametrization "
                                  "on the parameter '{}'".format(self, tensor_name))
+
+    def parametrization(self, tensor_name):
+        r"""Returns the active parametrization on a given Parameter
+        Args:
+            tensor_name (str): name of the Parameter
+        """
+        param = self._parametrizations.get(tensor_name)
+        if param is None:
+            raise ValueError("Module '{}' does not have a parametrization "
+                             "on the parameter '{}'".format(self, tensor_name))
+        return param
+
 
     def undo_parametrization(self, tensor_name):
         r"""Undoes the parametrizations active on the paramter ``tensor_name``.
@@ -721,6 +736,8 @@ class Module(object):
             del self._buffers[name]
         elif name in self._modules:
             del self._modules[name]
+        elif name in self._parametrizations:
+            del self._parametrizations[name]
         else:
             object.__delattr__(self, name)
 
@@ -776,7 +793,8 @@ class Module(object):
             destination._metadata = OrderedDict()
         destination._metadata[prefix[:-1]] = local_metadata = dict(version=self._version)
         self._save_to_state_dict(destination, prefix, keep_vars)
-        for name, module in self._modules.items():
+        for name, module in itertools.chain(self._modules.items(),
+                                            self._parametrizations.items()):
             if module is not None:
                 module.state_dict(destination, prefix + name + '.', keep_vars=keep_vars)
         for hook in self._state_dict_hooks.values():
@@ -866,7 +884,9 @@ class Module(object):
                 if key.startswith(prefix):
                     input_name = key[len(prefix):]
                     input_name = input_name.split('.', 1)[0]  # get the name of param/buffer/child
-                    if input_name not in self._modules and input_name not in local_state:
+                    if input_name not in self._modules and \
+                       input_name not in self._parametrizations and \
+                       input_name not in local_state:
                         unexpected_keys.append(key)
 
     def load_state_dict(self, state_dict, strict=True):
@@ -901,7 +921,9 @@ class Module(object):
             local_metadata = {} if metadata is None else metadata.get(prefix[:-1], {})
             module._load_from_state_dict(
                 state_dict, prefix, local_metadata, True, missing_keys, unexpected_keys, error_msgs)
-            for name, child in module._modules.items():
+
+            for name, module in itertools.chain(self._modules.items(),
+                                                self._parametrizations.items()):
                 if child is not None:
                     load(child, prefix + name + '.')
 
@@ -926,7 +948,8 @@ class Module(object):
     def _named_members(self, get_members_fn, prefix='', recurse=True):
         r"""Helper method for yielding various names + members of modules."""
         memo = set()
-        modules = self.named_modules(prefix=prefix) if recurse else [(prefix, self)]
+        modules = itertools.chain(self.named_modules(prefix=prefix) if recurse else [(prefix, self)],
+                                  self.named_parametrizations(prefix=prefix) if recurse else [(prefix, self)])
         for module_prefix, module in modules:
             members = get_members_fn(module)
             for k, v in members:
@@ -1058,7 +1081,8 @@ class Module(object):
 
         """
         memo = set()
-        for name, module in self._modules.items():
+        for name, module in itertools.chain(self._modules.items(),
+                                            self._parametrizations.items()):
             if module is not None and module not in memo:
                 memo.add(module)
                 yield name, module
@@ -1120,13 +1144,60 @@ class Module(object):
             memo = set()
         if self not in memo:
             memo.add(self)
-            yield prefix, self
+            if not hasattr(self, "cache"):
+                yield prefix, self
             for name, module in self._modules.items():
                 if module is None:
                     continue
                 submodule_prefix = prefix + ('.' if prefix else '') + name
                 for m in module.named_modules(memo, submodule_prefix):
                     yield m
+
+    def parametrizations(self):
+        r"""Returns an iterator over all modules in the network.
+
+        Yields:
+            nn.Parametrization: a parametrization in the network
+
+        Example::
+
+            >>> for name, param in self.parametrizations():
+            >>>    if name in ['weight']:
+            >>>        print(param.orig.size())
+
+        """
+        for name, param in self.named_parametrization():
+            yield param
+
+    def named_parametrizations(self, memo=None, prefix=''):
+        r"""Returns an iterator over all parametrizations in the network, yielding
+        both the name of the parametrization as well as the parametrization itself.
+
+        Yields:
+            (string, nn.Parametrization): Tuple of name and parametrization
+        Example::
+
+            >>> for name, param in self.named_parametrizations():
+            >>>    if name in ['weight']:
+            >>>        print(param.orig.size())
+
+        """
+        if memo is None:
+            memo = set()
+        if self not in memo:
+            memo.add(self)
+            # Could be better
+            if hasattr(self, "cache") and isinstance(self.cache, property):
+                yield prefix, self
+            for name, module in itertools.chain(self._modules.items(),
+                                                self._parametrizations.items()):
+                if module is None:
+                    continue
+                submodule_prefix = prefix + ('.' if prefix else '') + name
+                for m in module.named_modules(memo, submodule_prefix):
+                    yield m
+
+
 
     def train(self, mode=True):
         r"""Sets the module in training mode.
@@ -1218,6 +1289,10 @@ class Module(object):
             mod_str = repr(module)
             mod_str = _addindent(mod_str, 2)
             child_lines.append('(' + key + '): ' + mod_str)
+        for key, module in self._parametrization.items():
+            mod_str = repr(module)
+            mod_str = _addindent(mod_str, 2)
+            child_lines.append('(param ' + key + '): ' + mod_str)
         lines = extra_lines + child_lines
 
         main_str = self._get_name() + '('
@@ -1236,8 +1311,9 @@ class Module(object):
         attrs = list(self.__dict__.keys())
         parameters = list(self._parameters.keys())
         modules = list(self._modules.keys())
+        parametrizations = list(self._parametrizations.keys())
         buffers = list(self._buffers.keys())
-        keys = module_attrs + attrs + parameters + modules + buffers
+        keys = module_attrs + attrs + parameters + modules + parametrizations + buffers
 
         # Eliminate attrs that are not legal Python variable names
         keys = [key for key in keys if not key[0].isdigit()]
@@ -1250,4 +1326,6 @@ class Module(object):
         replica._parameters = replica._parameters.copy()
         replica._buffers = replica._buffers.copy()
         replica._modules = replica._modules.copy()
+        replica._parametrizations = replica._parametrizations.copy()
         return replica
+
